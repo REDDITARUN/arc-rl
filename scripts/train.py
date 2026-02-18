@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -189,13 +190,31 @@ def main() -> None:
     print()
 
     best_eval_acc = 0.0
-    for it in range(start_iter, train_cfg.num_iterations):
+    pbar = tqdm(
+        range(start_iter, train_cfg.num_iterations),
+        initial=start_iter,
+        total=train_cfg.num_iterations,
+        desc="Training",
+        unit="it",
+        dynamic_ncols=True,
+    )
+    for it in pbar:
         metrics = trainer.train_step(it)
 
-        # Logging
+        # Update progress bar
+        pbar.set_postfix(
+            loss=f"{metrics.loss:.3f}",
+            reward=f"{metrics.mean_reward:.3f}",
+            exact=f"{100*metrics.exact_match_rate:.1f}%",
+            gnorm=f"{metrics.grad_norm:.1f}",
+            sps=f"{metrics.steps_per_sec:.0f}",
+            ordered=True,
+        )
+
+        # Detailed logging
         if (it + 1) % train_cfg.log_interval == 0:
             lr = optimizer.param_groups[0]["lr"]
-            print(
+            tqdm.write(
                 f"[{it+1:>6d}] "
                 f"loss={metrics.loss:.4f}  "
                 f"reward={metrics.mean_reward:.3f}  "
@@ -221,7 +240,7 @@ def main() -> None:
 
         # Evaluation
         if (it + 1) % train_cfg.eval_interval == 0:
-            print(f"\n--- Evaluation at iteration {it+1} ---")
+            tqdm.write(f"\n--- Evaluation at iteration {it+1} ---")
             eval_cfg = EvalConfig(
                 data_dir=train_cfg.data_dir,
                 split="training",
@@ -245,7 +264,7 @@ def main() -> None:
                     "model_cfg": vars(model_cfg),
                     "train_cfg": vars(train_cfg),
                 }, path)
-                print(f"  New best! Saved to {path}")
+                tqdm.write(f"  New best! Saved to {path}")
 
             if train_cfg.wandb_enabled:
                 import wandb
@@ -254,7 +273,6 @@ def main() -> None:
                     "eval/solved": bench.solved,
                     "eval/mean_pixel_acc": bench.mean_pixel_acc,
                 }, step=it + 1)
-            print()
 
         # Periodic save
         if (it + 1) % train_cfg.save_interval == 0:
@@ -268,7 +286,9 @@ def main() -> None:
                 "model_cfg": vars(model_cfg),
                 "train_cfg": vars(train_cfg),
             }, path)
+            tqdm.write(f"  Checkpoint saved: {path}")
 
+    pbar.close()
     print("\nTraining complete!")
 
 
