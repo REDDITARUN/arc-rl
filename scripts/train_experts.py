@@ -28,11 +28,12 @@ def worker_fn(
     model_cfg_dict: dict,
     args_dict: dict,
     output_dir: str,
-    progress_file: str,
+    counter_file: str,
 ):
     """Worker process: train a subset of tasks sequentially."""
     import random
     import numpy as np
+    from tqdm import tqdm
 
     seed = args_dict["seed"] + rank
     random.seed(seed)
@@ -51,7 +52,16 @@ def worker_fn(
     solved = 0
     total = len(task_data)
 
-    for i, (task_id, train_pairs, test_pairs) in enumerate(task_data):
+    desc = f"W{rank}" if args_dict.get("num_workers", 1) > 1 else "Tasks"
+    pbar = tqdm(
+        task_data,
+        desc=desc,
+        position=rank,
+        leave=True,
+        dynamic_ncols=True,
+    )
+
+    for task_id, train_pairs, test_pairs in pbar:
         task = ARCTask(task_id=task_id, train_pairs=train_pairs, test_pairs=test_pairs)
 
         # Skip if already done (allows resuming)
@@ -61,7 +71,7 @@ def worker_fn(
                 d = Demo.load(demo_path)
                 if d.solved:
                     solved += 1
-                _write_progress(progress_file, rank, i + 1, total, solved)
+                pbar.set_postfix(solved=solved, last="skip", ordered=True)
                 continue
             except Exception:
                 pass
@@ -83,13 +93,12 @@ def worker_fn(
         if demo.solved:
             solved += 1
 
-        _write_progress(progress_file, rank, i + 1, total, solved)
-
-
-def _write_progress(path: str, rank: int, done: int, total: int, solved: int):
-    """Append one-line progress to a shared file."""
-    with open(path, "a") as f:
-        f.write(f"worker={rank} done={done}/{total} solved={solved}\n")
+        status = "SOLVED" if demo.solved else f"r={demo.best_reward:.2f}"
+        pbar.set_postfix(
+            solved=solved,
+            last=f"{task_id[:8]}:{status}:{demo.iterations}it",
+            ordered=True,
+        )
 
 
 def parse_args():
@@ -161,15 +170,16 @@ def main():
         "patience": args.patience, "lr": args.lr,
         "entropy_coeff": args.entropy_coeff,
         "num_grad_steps": args.num_grad_steps, "seed": args.seed,
+        "num_workers": args.num_workers,
     }
 
-    progress_file = str(output_dir / "_progress.log")
-    open(progress_file, "w").close()  # clear
+    counter_file = str(output_dir / "_progress.log")
+    open(counter_file, "w").close()
 
     t0 = time.time()
 
     if args.num_workers <= 1:
-        worker_fn(0, task_data, model_cfg_dict, args_dict, str(output_dir), progress_file)
+        worker_fn(0, task_data, model_cfg_dict, args_dict, str(output_dir), counter_file)
     else:
         mp.set_start_method("spawn", force=True)
         processes = []
@@ -177,34 +187,10 @@ def main():
             p = mp.Process(
                 target=worker_fn,
                 args=(rank, chunks[rank], model_cfg_dict, args_dict,
-                      str(output_dir), progress_file),
+                      str(output_dir), counter_file),
             )
             p.start()
             processes.append(p)
-
-        # Monitor progress
-        import time as _time
-        total_tasks = len(task_data)
-        while any(p.is_alive() for p in processes):
-            _time.sleep(10)
-            done_count = sum(1 for f in output_dir.glob("*.json") if not f.name.startswith("_"))
-            solved_count = 0
-            for f in output_dir.glob("*.json"):
-                if f.name.startswith("_"):
-                    continue
-                try:
-                    with open(f) as fh:
-                        d = json.load(fh)
-                    if d.get("solved"):
-                        solved_count += 1
-                except Exception:
-                    pass
-            elapsed = time.time() - t0
-            rate = done_count / max(elapsed, 1) * 3600
-            eta = (total_tasks - done_count) / max(rate / 3600, 1e-9)
-            print(f"\r  [{done_count}/{total_tasks}] solved={solved_count} "
-                  f"rate={rate:.0f}/hr  elapsed={elapsed/60:.1f}m  ETA={eta/60:.1f}m",
-                  end="", flush=True)
 
         for p in processes:
             p.join()
