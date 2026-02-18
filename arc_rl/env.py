@@ -58,6 +58,42 @@ def encode_context(
     return torch.cat(channels, dim=0)  # [(max_ex*2+1)*11, 30, 30]
 
 
+def reconstruct_obs(
+    grids: torch.Tensor,
+    grid_h: torch.Tensor,
+    grid_w: torch.Tensor,
+    context_channels: torch.Tensor,
+    step: int,
+    max_steps: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reconstruct (obs, grid_masks) from stored grid state + cached context.
+
+    Args:
+        grids: [N, 30, 30] long
+        grid_h, grid_w: [N] long
+        context_channels: [N, C_ctx, 30, 30] float
+        step: current timestep index
+        max_steps: episode length
+
+    Returns:
+        obs: [N, C, 30, 30], grid_masks: [N, 30, 30]
+    """
+    N = grids.shape[0]
+    y_idx = torch.arange(GRID_SIZE, device=device).view(1, GRID_SIZE, 1)
+    x_idx = torch.arange(GRID_SIZE, device=device).view(1, 1, GRID_SIZE)
+
+    one_hot = F.one_hot(grids, NUM_COLORS).permute(0, 3, 1, 2).float()
+    grid_masks = (y_idx < grid_h.view(-1, 1, 1)) & (x_idx < grid_w.view(-1, 1, 1))
+    current = torch.cat([one_hot, grid_masks.unsqueeze(1).float()], dim=1)
+
+    step_val = step / max(max_steps, 1)
+    step_ch = torch.full((N, 1, GRID_SIZE, GRID_SIZE), step_val, device=device)
+
+    obs = torch.cat([context_channels, current, step_ch], dim=1)
+    return obs, grid_masks
+
+
 class BatchedARCEnv:
     """Manages B*K parallel ARC environments for batched GRPO rollouts.
 

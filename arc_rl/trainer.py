@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from .config import ModelConfig, TrainConfig, GRID_SIZE, NUM_COLORS
 from .dataset import ARCDataset, ARCTask, augment_colors, augment_geometry, Pair, Grid
-from .env import BatchedARCEnv
+from .env import BatchedARCEnv, reconstruct_obs
 from .model import (
     ARCPolicy,
     StepActions,
@@ -103,29 +103,16 @@ class GRPOTrainer:
     def _reconstruct_obs(
         self, rollout: RolloutData, step_idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Reconstruct observation and grid masks from stored state.
-
-        Returns (obs [N, C, 30, 30], grid_masks [N, 30, 30]).
-        """
-        grids = rollout.stored_grids[step_idx]       # [N, 30, 30]
-        grid_h = rollout.stored_grid_h[step_idx]     # [N]
-        grid_w = rollout.stored_grid_w[step_idx]     # [N]
-
-        one_hot = F.one_hot(grids, NUM_COLORS).permute(0, 3, 1, 2).float()
-        grid_masks = (self._y_idx < grid_h.view(-1, 1, 1)) & (
-            self._x_idx < grid_w.view(-1, 1, 1)
+        """Reconstruct observation and grid masks from stored state."""
+        return reconstruct_obs(
+            rollout.stored_grids[step_idx],
+            rollout.stored_grid_h[step_idx],
+            rollout.stored_grid_w[step_idx],
+            rollout.context_channels,
+            step_idx,
+            self.cfg.max_steps,
+            self.device,
         )
-        masks_f = grid_masks.unsqueeze(1).float()
-        current = torch.cat([one_hot, masks_f], dim=1)  # [N, 11, 30, 30]
-
-        step_val = step_idx / max(self.cfg.max_steps, 1)
-        N = grids.shape[0]
-        step_ch = torch.full(
-            (N, 1, GRID_SIZE, GRID_SIZE), step_val, device=self.device
-        )
-
-        obs = torch.cat([rollout.context_channels, current, step_ch], dim=1)
-        return obs, grid_masks
 
     @torch.no_grad()
     def collect_rollouts(
