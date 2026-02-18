@@ -15,9 +15,8 @@ def _grid_to_tensor(grid: Grid, device: torch.device) -> torch.Tensor:
     """Convert a python grid to a padded 30x30 long tensor."""
     h, w = len(grid), len(grid[0])
     t = torch.zeros(GRID_SIZE, GRID_SIZE, dtype=torch.long, device=device)
-    for r in range(h):
-        for c in range(w):
-            t[r, c] = grid[r][c]
+    src = torch.tensor(grid, dtype=torch.long, device=device)
+    t[:h, :w] = src
     return t
 
 
@@ -42,19 +41,19 @@ def encode_context(
     Returns: [C_context, 30, 30] where C_context = (max_examples*2 + 1) * 11
     """
     channels: List[torch.Tensor] = []
+    zeros = torch.zeros(NUM_COLORS + 1, GRID_SIZE, GRID_SIZE, device=device)
     for i in range(max_examples):
         if i < len(examples):
             inp, out = examples[i]
-            inp_t = _grid_to_tensor(inp, device)
-            out_t = _grid_to_tensor(out, device)
-            channels.append(encode_grid(inp_t, len(inp), len(inp[0]), device))
-            channels.append(encode_grid(out_t, len(out), len(out[0]), device))
+            channels.append(encode_grid(_grid_to_tensor(inp, device), len(inp), len(inp[0]), device))
+            channels.append(encode_grid(_grid_to_tensor(out, device), len(out), len(out[0]), device))
         else:
-            channels.append(torch.zeros(NUM_COLORS + 1, GRID_SIZE, GRID_SIZE, device=device))
-            channels.append(torch.zeros(NUM_COLORS + 1, GRID_SIZE, GRID_SIZE, device=device))
+            channels.append(zeros)
+            channels.append(zeros)
 
-    test_t = _grid_to_tensor(test_input, device)
-    channels.append(encode_grid(test_t, len(test_input), len(test_input[0]), device))
+    channels.append(encode_grid(
+        _grid_to_tensor(test_input, device), len(test_input), len(test_input[0]), device
+    ))
 
     return torch.cat(channels, dim=0)  # [(max_ex*2+1)*11, 30, 30]
 
@@ -85,17 +84,24 @@ class BatchedARCEnv:
 
         # Pre-encode shared task contexts: [B, C_context, 30, 30]
         contexts = []
-        self.targets: List[torch.Tensor] = []
-        self.target_shapes: List[Tuple[int, int]] = []
-        for examples, test_input, target_output in task_instances:
+        self.target_h = torch.zeros(self.B, dtype=torch.long, device=device)
+        self.target_w = torch.zeros(self.B, dtype=torch.long, device=device)
+        self.targets = torch.zeros(self.B, GRID_SIZE, GRID_SIZE, dtype=torch.long, device=device)
+        for b, (examples, test_input, target_output) in enumerate(task_instances):
             contexts.append(encode_context(examples, test_input, max_examples, device))
-            self.targets.append(_grid_to_tensor(target_output, device))
-            self.target_shapes.append((len(target_output), len(target_output[0])))
+            th, tw = len(target_output), len(target_output[0])
+            self.target_h[b] = th
+            self.target_w[b] = tw
+            self.targets[b] = _grid_to_tensor(target_output, device)
 
         # [B, C_ctx, 30, 30] → expand to [N, C_ctx, 30, 30]
         ctx_stack = torch.stack(contexts, dim=0)  # [B, C, 30, 30]
         self.context_channels = ctx_stack.repeat_interleave(K, dim=0)  # [N, C, 30, 30]
-        self.context_dim = self.context_channels.shape[1]
+
+        # Expand targets to N for vectorized reward
+        self._target_h_n = self.target_h.repeat_interleave(K)  # [N]
+        self._target_w_n = self.target_w.repeat_interleave(K)  # [N]
+        self._targets_n = self.targets.repeat_interleave(K, dim=0)  # [N, 30, 30]
 
         # Per-rollout mutable state
         self.grids = torch.zeros(self.N, GRID_SIZE, GRID_SIZE, dtype=torch.long, device=device)
@@ -122,12 +128,10 @@ class BatchedARCEnv:
 
     def get_obs(self) -> torch.Tensor:
         """Build full observation tensor [N, in_channels, 30, 30]."""
-        # Current output encoding: [N, 11, 30, 30]
-        one_hot = F.one_hot(self.grids.long(), NUM_COLORS).permute(0, 3, 1, 2).float()
+        one_hot = F.one_hot(self.grids, NUM_COLORS).permute(0, 3, 1, 2).float()
         masks = self.get_grid_masks().unsqueeze(1).float()  # [N, 1, 30, 30]
         current_channels = torch.cat([one_hot, masks], dim=1)
 
-        # Step counter channel
         step_val = self.step_count / max(self.max_steps, 1)
         step_channel = torch.full(
             (self.N, 1, GRID_SIZE, GRID_SIZE), step_val, device=self.device
@@ -152,19 +156,22 @@ class BatchedARCEnv:
         self.step_count += 1
 
     def compute_rewards(self) -> torch.Tensor:
-        """Compute per-rollout reward. Returns [N] float tensor."""
-        rewards = torch.zeros(self.N, device=self.device)
-        for b in range(self.B):
-            th, tw = self.target_shapes[b]
-            target = self.targets[b][:th, :tw]
-            for k_offset in range(self.K):
-                i = b * self.K + k_offset
-                h = self.grid_h[i].item()
-                w = self.grid_w[i].item()
-                if h == th and w == tw:
-                    pred = self.grids[i, :h, :w]
-                    acc = (pred == target).float().mean()
-                    rewards[i] = 2.0 if acc.item() == 1.0 else acc.item()
+        """Fully vectorized reward computation. Returns [N] float tensor."""
+        # Check size match
+        size_match = (self.grid_h == self._target_h_n) & (self.grid_w == self._target_w_n)
+
+        # Compute pixel accuracy using full 30x30 grids (masked to valid region)
+        target_mask = (self._y_idx < self._target_h_n.view(-1, 1, 1)) & (
+            self._x_idx < self._target_w_n.view(-1, 1, 1)
+        )  # [N, 30, 30]
+        cell_correct = (self.grids == self._targets_n) & target_mask  # [N, 30, 30]
+        num_correct = cell_correct.sum(dim=(1, 2)).float()  # [N]
+        num_total = target_mask.sum(dim=(1, 2)).float().clamp(min=1)  # [N]
+        pixel_acc = num_correct / num_total  # [N]
+
+        exact = (pixel_acc == 1.0)
+        rewards = torch.where(exact, torch.tensor(2.0, device=self.device), pixel_acc)
+        rewards = torch.where(size_match, rewards, torch.tensor(0.0, device=self.device))
         return rewards
 
     def get_predicted_grids(self) -> List[List[List[int]]]:

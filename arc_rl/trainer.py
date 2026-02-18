@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -10,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import ModelConfig, TrainConfig, GRID_SIZE
+from .config import ModelConfig, TrainConfig, GRID_SIZE, NUM_COLORS
 from .dataset import ARCDataset, ARCTask, augment_colors, augment_geometry, Pair, Grid
 from .env import BatchedARCEnv
 from .model import (
@@ -33,6 +34,10 @@ class RolloutData:
     paint_colors: torch.Tensor     # [T-1, N]
     paint_positions: torch.Tensor  # [T-1, N]
     rewards: torch.Tensor          # [N]
+    stored_grids: torch.Tensor     # [T, N, 30, 30]
+    stored_grid_h: torch.Tensor    # [T, N]
+    stored_grid_w: torch.Tensor    # [T, N]
+    context_channels: torch.Tensor # [N, C_ctx, 30, 30]
     B: int = 0
     K: int = 0
 
@@ -71,6 +76,10 @@ class GRPOTrainer:
         self.device = device
         self.amp_dtype = torch.bfloat16 if train_cfg.bf16 else torch.float32
 
+        # Pre-allocate coordinate indices for obs reconstruction
+        self._y_idx = torch.arange(GRID_SIZE, device=device).view(1, GRID_SIZE, 1)
+        self._x_idx = torch.arange(GRID_SIZE, device=device).view(1, 1, GRID_SIZE)
+
     def _prepare_task_instances(
         self, tasks: List[ARCTask]
     ) -> List[Tuple[List[Pair], Grid, Grid]]:
@@ -91,11 +100,38 @@ class GRPOTrainer:
             instances.append((examples, test_input, target_output))
         return instances
 
+    def _reconstruct_obs(
+        self, rollout: RolloutData, step_idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reconstruct observation and grid masks from stored state.
+
+        Returns (obs [N, C, 30, 30], grid_masks [N, 30, 30]).
+        """
+        grids = rollout.stored_grids[step_idx]       # [N, 30, 30]
+        grid_h = rollout.stored_grid_h[step_idx]     # [N]
+        grid_w = rollout.stored_grid_w[step_idx]     # [N]
+
+        one_hot = F.one_hot(grids, NUM_COLORS).permute(0, 3, 1, 2).float()
+        grid_masks = (self._y_idx < grid_h.view(-1, 1, 1)) & (
+            self._x_idx < grid_w.view(-1, 1, 1)
+        )
+        masks_f = grid_masks.unsqueeze(1).float()
+        current = torch.cat([one_hot, masks_f], dim=1)  # [N, 11, 30, 30]
+
+        step_val = step_idx / max(self.cfg.max_steps, 1)
+        N = grids.shape[0]
+        step_ch = torch.full(
+            (N, 1, GRID_SIZE, GRID_SIZE), step_val, device=self.device
+        )
+
+        obs = torch.cat([rollout.context_channels, current, step_ch], dim=1)
+        return obs, grid_masks
+
     @torch.no_grad()
     def collect_rollouts(
         self, task_instances: List[Tuple[List[Pair], Grid, Grid]]
     ) -> RolloutData:
-        """Run K rollouts per task, return stored actions + rewards."""
+        """Run K rollouts per task, store grid states for gradient replay."""
         B = len(task_instances)
         K = self.cfg.num_rollouts
         N = B * K
@@ -107,20 +143,33 @@ class GRPOTrainer:
             device=self.device,
         )
 
-        self.policy.eval()
+        # Pre-allocate state storage
+        stored_grids = torch.zeros(T, N, GRID_SIZE, GRID_SIZE, dtype=torch.long, device=self.device)
+        stored_grid_h = torch.zeros(T, N, dtype=torch.long, device=self.device)
+        stored_grid_w = torch.zeros(T, N, dtype=torch.long, device=self.device)
 
-        obs = env.reset()  # [N, C, 30, 30]
+        self.policy.eval()
+        obs = env.reset()
+
+        # Store initial state (step 0)
+        stored_grids[0] = env.grids
+        stored_grid_h[0] = env.grid_h
+        stored_grid_w[0] = env.grid_w
 
         # --- Step 0: RESIZE ---
         with torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.cfg.bf16):
             outputs = self.policy(obs)
         actions_0 = sample_resize(outputs)
-        env.resize(actions_0.resize_h + 1, actions_0.resize_w + 1)  # convert 0-indexed → 1-indexed
+        env.resize(actions_0.resize_h + 1, actions_0.resize_w + 1)
 
         # --- Steps 1..T-1: PAINT ---
         all_colors = []
         all_positions = []
         for step in range(1, T):
+            stored_grids[step] = env.grids
+            stored_grid_h[step] = env.grid_h
+            stored_grid_w[step] = env.grid_w
+
             obs = env.get_obs()
             masks = env.get_grid_masks()
             with torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.cfg.bf16):
@@ -133,15 +182,18 @@ class GRPOTrainer:
             all_positions.append(actions_t.position)
 
         rewards = env.compute_rewards()
-
         self.policy.train()
 
         return RolloutData(
             resize_h=actions_0.resize_h,
             resize_w=actions_0.resize_w,
-            paint_colors=torch.stack(all_colors, dim=0),      # [T-1, N]
-            paint_positions=torch.stack(all_positions, dim=0), # [T-1, N]
+            paint_colors=torch.stack(all_colors, dim=0),
+            paint_positions=torch.stack(all_positions, dim=0),
             rewards=rewards,
+            stored_grids=stored_grids,
+            stored_grid_h=stored_grid_h,
+            stored_grid_w=stored_grid_w,
+            context_channels=env.context_channels,
             B=B,
             K=K,
         )
@@ -154,70 +206,57 @@ class GRPOTrainer:
         advantages = ((rewards - mean) / std).reshape(-1)  # [N]
         return advantages
 
-    def update_policy(
-        self, task_instances: List[Tuple[List[Pair], Grid, Grid]], rollout: RolloutData
-    ) -> Tuple[float, float, float]:
-        """Replay trajectories with gradients, compute GRPO loss, update."""
-        B, K, T = rollout.B, rollout.K, self.cfg.max_steps
-        N = B * K
+    def update_policy(self, rollout: RolloutData) -> Tuple[float, float, float]:
+        """Replay from stored states with gradients, compute GRPO loss, update.
 
-        advantages = self.compute_advantages(rollout)  # [N]
-
-        env = BatchedARCEnv(
-            task_instances, K, T,
-            max_examples=self.model_cfg.max_examples,
-            device=self.device,
-        )
-        obs = env.reset()
+        Uses subsampled steps if cfg.num_grad_steps < max_steps.
+        """
+        T = self.cfg.max_steps
+        advantages = self.compute_advantages(rollout)
 
         self.policy.train()
         self.optimizer.zero_grad()
 
+        # Determine which steps to compute gradients for
+        num_grad_steps = self.cfg.num_grad_steps
+        if num_grad_steps <= 0 or num_grad_steps >= T:
+            step_indices = list(range(T))
+        else:
+            paint_steps = sorted(random.sample(range(1, T), min(num_grad_steps - 1, T - 1)))
+            step_indices = [0] + paint_steps
+
+        # Scale factor so total gradient magnitude approximates full-trajectory gradient
+        scale = T / len(step_indices)
+
         total_policy_loss = 0.0
         total_entropy = 0.0
 
-        # --- Step 0: RESIZE (with grad) ---
-        with torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.cfg.bf16):
-            outputs = self.policy(obs)
-            stored = StepActions(resize_h=rollout.resize_h, resize_w=rollout.resize_w)
-            log_probs = compute_log_probs_resize(outputs, stored)
-            step_loss = -(advantages * log_probs).mean()
-            ent = compute_entropy_resize(outputs)
-
-        step_loss_total = step_loss - self.cfg.entropy_coeff * ent
-        step_loss_total.backward()
-
-        total_policy_loss += step_loss.item()
-        total_entropy += ent.item()
-
-        with torch.no_grad():
-            env.resize(rollout.resize_h + 1, rollout.resize_w + 1)
-
-        # --- Steps 1..T-1: PAINT (with grad) ---
-        for step_idx in range(T - 1):
-            obs = env.get_obs()
-            masks = env.get_grid_masks()
+        for step_idx in step_indices:
+            obs, grid_masks = self._reconstruct_obs(rollout, step_idx)
 
             with torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.cfg.bf16):
                 outputs = self.policy(obs)
-                stored = StepActions(
-                    color=rollout.paint_colors[step_idx],
-                    position=rollout.paint_positions[step_idx],
-                )
-                log_probs = compute_log_probs_paint(outputs, stored, masks)
-                step_loss = -(advantages * log_probs).mean()
-                ent = compute_entropy_paint(outputs, masks)
 
-            step_loss_total = step_loss - self.cfg.entropy_coeff * ent
-            step_loss_total.backward()
+                if step_idx == 0:
+                    stored = StepActions(resize_h=rollout.resize_h, resize_w=rollout.resize_w)
+                    log_probs = compute_log_probs_resize(outputs, stored)
+                    ent = compute_entropy_resize(outputs)
+                else:
+                    paint_idx = step_idx - 1
+                    stored = StepActions(
+                        color=rollout.paint_colors[paint_idx],
+                        position=rollout.paint_positions[paint_idx],
+                    )
+                    log_probs = compute_log_probs_paint(outputs, stored, grid_masks)
+                    ent = compute_entropy_paint(outputs, grid_masks)
+
+                step_loss = -(advantages * log_probs).mean()
+
+            step_total = (step_loss - self.cfg.entropy_coeff * ent) * scale
+            step_total.backward()
 
             total_policy_loss += step_loss.item()
             total_entropy += ent.item()
-
-            with torch.no_grad():
-                y = rollout.paint_positions[step_idx] // GRID_SIZE
-                x = rollout.paint_positions[step_idx] % GRID_SIZE
-                env.paint(rollout.paint_colors[step_idx], x, y)
 
         grad_norm = nn.utils.clip_grad_norm_(
             self.policy.parameters(), self.cfg.grad_clip
@@ -226,8 +265,9 @@ class GRPOTrainer:
         if self.scheduler is not None:
             self.scheduler.step()
 
-        avg_policy_loss = total_policy_loss / T
-        avg_entropy = total_entropy / T
+        n_steps = len(step_indices)
+        avg_policy_loss = total_policy_loss / n_steps
+        avg_entropy = total_entropy / n_steps
         return avg_policy_loss, avg_entropy, grad_norm
 
     def train_step(self, iteration: int) -> TrainMetrics:
@@ -238,7 +278,7 @@ class GRPOTrainer:
         task_instances = self._prepare_task_instances(tasks)
 
         rollout = self.collect_rollouts(task_instances)
-        policy_loss, entropy, grad_norm = self.update_policy(task_instances, rollout)
+        policy_loss, entropy, grad_norm = self.update_policy(rollout)
 
         rewards = rollout.rewards
         exact = (rewards >= 2.0).float()

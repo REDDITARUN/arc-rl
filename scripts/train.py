@@ -38,6 +38,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tasks-per-batch", type=int, default=16)
     p.add_argument("--max-steps", type=int, default=150)
     p.add_argument("--num-iterations", type=int, default=50000)
+    p.add_argument("--num-grad-steps", type=int, default=32,
+                   help="Subsample this many steps for gradient (0=all steps)")
     p.add_argument("--warmup-steps", type=int, default=1000)
 
     # Data & augmentation
@@ -96,6 +98,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         entropy_coeff=args.entropy_coeff,
+        num_grad_steps=args.num_grad_steps,
         num_iterations=args.num_iterations,
         warmup_steps=args.warmup_steps,
         device=args.device,
@@ -185,7 +188,7 @@ def main() -> None:
     # -----------------------------------------------------------------------
     print(f"\nStarting training for {train_cfg.num_iterations} iterations")
     print(f"  B={train_cfg.tasks_per_batch}, K={train_cfg.num_rollouts}, "
-          f"T={train_cfg.max_steps}")
+          f"T={train_cfg.max_steps}, grad_steps={train_cfg.num_grad_steps}")
     print(f"  lr={train_cfg.lr}, entropy_coeff={train_cfg.entropy_coeff}")
     print()
 

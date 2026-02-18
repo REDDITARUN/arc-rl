@@ -36,6 +36,7 @@ class TrainConfig:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     entropy_coeff: float = 0.01
+    num_grad_steps: int = 32
 
     num_iterations: int = 50000
     warmup_steps: int = 1000
