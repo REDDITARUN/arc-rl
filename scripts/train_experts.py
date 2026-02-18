@@ -79,6 +79,16 @@ def worker_fn(
         tqdm.write(f"[W{rank}] ({i+1}/{total}) Training {task_id} ...")
         t_start = __import__("time").time()
 
+        def on_inner_progress(cur_it: int, max_it: int, best_r: float, no_improve: int):
+            pbar.set_postfix(
+                solved=solved,
+                task=task_id[:8],
+                inner=f"{cur_it}/{max_it}",
+                best=f"{best_r:.2f}",
+                stall=no_improve,
+                ordered=True,
+            )
+
         demo = train_task(
             task=task,
             model_cfg=model_cfg,
@@ -90,6 +100,8 @@ def worker_fn(
             patience=args_dict["patience"],
             entropy_coeff=args_dict["entropy_coeff"],
             num_grad_steps=args_dict["num_grad_steps"],
+            progress_cb=on_inner_progress,
+            progress_every=args_dict["inner_log_every"],
         )
         demo.save(demo_path)
 
@@ -128,6 +140,8 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--entropy-coeff", type=float, default=0.01)
     p.add_argument("--num-grad-steps", type=int, default=16)
+    p.add_argument("--inner-log-every", type=int, default=10,
+                   help="Update per-task inner progress every N iterations")
     p.add_argument("--seed", type=int, default=42)
 
     return p.parse_args()
@@ -181,6 +195,7 @@ def main():
         "num_grad_steps": args.num_grad_steps, "seed": args.seed,
         "num_workers": args.num_workers,
         "device": args.device,
+        "inner_log_every": args.inner_log_every,
     }
 
     counter_file = str(output_dir / "_progress.log")

@@ -7,7 +7,7 @@ import json
 import random
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -95,6 +95,8 @@ def train_task(
     entropy_coeff: float = 0.01,
     grad_clip: float = 1.0,
     num_grad_steps: int = 16,
+    progress_cb: Optional[Callable[[int, int, float, int], None]] = None,
+    progress_every: int = 10,
 ) -> Demo:
     """Train a small expert model on a single task.
 
@@ -201,6 +203,9 @@ def train_task(
 
         nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
         optimizer.step()
+
+        if progress_cb is not None and ((it + 1) % max(progress_every, 1) == 0):
+            progress_cb(it + 1, max_iters, best_reward, no_improve)
 
     if best_demo is None:
         best_demo = {
