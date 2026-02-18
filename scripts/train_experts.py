@@ -61,7 +61,7 @@ def worker_fn(
         dynamic_ncols=True,
     )
 
-    for task_id, train_pairs, test_pairs in pbar:
+    for i, (task_id, train_pairs, test_pairs) in enumerate(pbar):
         task = ARCTask(task_id=task_id, train_pairs=train_pairs, test_pairs=test_pairs)
 
         # Skip if already done (allows resuming)
@@ -75,6 +75,9 @@ def worker_fn(
                 continue
             except Exception:
                 pass
+
+        tqdm.write(f"[W{rank}] ({i+1}/{total}) Training {task_id} ...")
+        t_start = __import__("time").time()
 
         demo = train_task(
             task=task,
@@ -93,10 +96,15 @@ def worker_fn(
         if demo.solved:
             solved += 1
 
+        elapsed_task = __import__("time").time() - t_start
         status = "SOLVED" if demo.solved else f"r={demo.best_reward:.2f}"
+        tqdm.write(
+            f"[W{rank}] ({i+1}/{total}) {task_id}: {status} "
+            f"in {demo.iterations}it ({elapsed_task:.0f}s)"
+        )
         pbar.set_postfix(
             solved=solved,
-            last=f"{task_id[:8]}:{status}:{demo.iterations}it",
+            last=f"{task_id[:8]}:{status}",
             ordered=True,
         )
 
