@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 from dataclasses import dataclass, asdict
@@ -10,11 +11,10 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .config import ModelConfig, GRID_SIZE, NUM_COLORS
+from .config import ModelConfig, GRID_SIZE
 from .dataset import ARCTask, augment_colors, augment_geometry, Grid, Pair
-from .env import BatchedARCEnv, reconstruct_obs, _grid_to_tensor, encode_context
+from .env import reconstruct_obs, _grid_to_tensor, encode_context
 from .fast_collect import collect_rollouts_fast
 from .model import (
     ARCPolicy,
@@ -37,6 +37,9 @@ class Demo:
     resize_w: int
     paint_colors: List[int]
     paint_positions: List[int]
+    examples: Optional[List[Pair]] = None
+    test_input: Optional[Grid] = None
+    target_output: Optional[Grid] = None
 
     def save(self, path: str | Path) -> None:
         with open(path, "w") as f:
@@ -102,7 +105,11 @@ def train_task(
 
     best_reward = 0.0
     best_demo: Optional[Dict] = None
+    best_examples: Optional[List[Pair]] = None
+    best_test_input: Optional[Grid] = None
+    best_target_output: Optional[Grid] = None
     no_improve = 0
+    use_amp = device.type == "cuda"
 
     for it in range(max_iters):
         examples, test_input, target_output = task.get_training_instance(
@@ -142,6 +149,10 @@ def train_task(
                 "paint_colors": paint_colors[:, best_idx].cpu().tolist(),
                 "paint_positions": paint_positions[:, best_idx].cpu().tolist(),
             }
+            # Store the exact context that produced this trajectory for consistent BC replay.
+            best_examples = copy.deepcopy(examples)
+            best_test_input = copy.deepcopy(test_input)
+            best_target_output = copy.deepcopy(target_output)
             if best_reward >= 2.0:
                 break
         else:
@@ -172,7 +183,7 @@ def train_task(
                 result["stored_grid_w"][step_idx],
                 ctx, step_idx, T, device,
             )
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                 out = policy(obs_r)
                 if step_idx == 0:
                     stored = StepActions(resize_h=resize_h, resize_w=resize_w)
@@ -196,6 +207,9 @@ def train_task(
             "resize_h": 1, "resize_w": 1,
             "paint_colors": [0] * (T - 1), "paint_positions": [0] * (T - 1),
         }
+        best_examples = []
+        best_test_input = [[0]]
+        best_target_output = [[0]]
 
     return Demo(
         task_id=task.task_id,
@@ -206,4 +220,7 @@ def train_task(
         resize_w=best_demo["resize_w"],
         paint_colors=best_demo["paint_colors"],
         paint_positions=best_demo["paint_positions"],
+        examples=best_examples,
+        test_input=best_test_input,
+        target_output=best_target_output,
     )

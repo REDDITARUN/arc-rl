@@ -8,7 +8,6 @@ Usage:
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -41,7 +40,8 @@ def worker_fn(
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    device = torch.device("cuda")
+    device_name = args_dict.get("device", "cuda")
+    device = torch.device(device_name if (device_name != "cuda" or torch.cuda.is_available()) else "cpu")
     from arc_rl.config import ModelConfig
     from arc_rl.dataset import ARCTask
     from arc_rl.expert import train_task, Demo
@@ -114,6 +114,7 @@ def parse_args():
     p.add_argument("--data-dir", type=str, default="references/ARC-AGI/data")
     p.add_argument("--output-dir", type=str, default="demos")
     p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--device", type=str, default="cuda")
 
     # Expert model architecture (small and fast)
     p.add_argument("--hidden-channels", type=int, default=64)
@@ -179,6 +180,7 @@ def main():
         "entropy_coeff": args.entropy_coeff,
         "num_grad_steps": args.num_grad_steps, "seed": args.seed,
         "num_workers": args.num_workers,
+        "device": args.device,
     }
 
     counter_file = str(output_dir / "_progress.log")
@@ -202,6 +204,9 @@ def main():
 
         for p in processes:
             p.join()
+        failed = [p.exitcode for p in processes if p.exitcode != 0]
+        if failed:
+            raise RuntimeError(f"One or more workers failed with exit codes: {failed}")
 
     elapsed = time.time() - t0
     print(f"\n\nDone in {elapsed/60:.1f} minutes")

@@ -75,6 +75,7 @@ class GRPOTrainer:
         self.dataset = dataset
         self.device = device
         self.amp_dtype = torch.bfloat16 if train_cfg.bf16 else torch.float32
+        self.use_amp = train_cfg.bf16 and device.type == "cuda"
 
         # Pre-allocate coordinate indices for obs reconstruction
         self._y_idx = torch.arange(GRID_SIZE, device=device).view(1, GRID_SIZE, 1)
@@ -144,7 +145,7 @@ class GRPOTrainer:
         stored_grid_w[0] = env.grid_w
 
         # --- Step 0: RESIZE ---
-        with torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.cfg.bf16):
+        with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             outputs = self.policy(obs)
         actions_0 = sample_resize(outputs)
         env.resize(actions_0.resize_h + 1, actions_0.resize_w + 1)
@@ -159,7 +160,7 @@ class GRPOTrainer:
 
             obs = env.get_obs()
             masks = env.get_grid_masks()
-            with torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.cfg.bf16):
+            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 outputs = self.policy(obs)
             actions_t = sample_paint(outputs, masks)
             y = actions_t.position // GRID_SIZE
@@ -221,7 +222,7 @@ class GRPOTrainer:
         for step_idx in step_indices:
             obs, grid_masks = self._reconstruct_obs(rollout, step_idx)
 
-            with torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.cfg.bf16):
+            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 outputs = self.policy(obs)
 
                 if step_idx == 0:

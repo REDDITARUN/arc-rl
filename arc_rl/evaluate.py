@@ -45,6 +45,7 @@ def evaluate_task(
     """Evaluate a single ARC task: run K rollouts, pick the best."""
     policy.eval()
     amp_dtype = torch.bfloat16 if eval_cfg.bf16 else torch.float32
+    use_amp = eval_cfg.bf16 and device.type == "cuda"
 
     examples, test_input, target_output = task.get_eval_instance(
         test_idx=test_idx, max_examples=model_cfg.max_examples
@@ -62,7 +63,7 @@ def evaluate_task(
     obs = env.reset()
 
     # Step 0: RESIZE
-    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=eval_cfg.bf16):
+    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
         outputs = policy(obs)
     actions = sample_resize(outputs)
     env.resize(actions.resize_h + 1, actions.resize_w + 1)
@@ -71,7 +72,7 @@ def evaluate_task(
     for step in range(1, T):
         obs = env.get_obs()
         masks = env.get_grid_masks()
-        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=eval_cfg.bf16):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             outputs = policy(obs)
         actions = sample_paint(outputs, masks)
         y = actions.position // GRID_SIZE

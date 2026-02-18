@@ -53,10 +53,14 @@ arc_rl/
 │   ├── env.py            # Vectorized ARC environment
 │   ├── model.py          # ResNet policy network (AlphaZero-style)
 │   ├── trainer.py        # GRPO trainer + rollout logic
+│   ├── expert.py         # Per-task expert RL training + demo schema
+│   ├── fast_collect.py   # Lower-overhead rollout collection path
 │   ├── renderer.py       # Grid visualization
 │   └── evaluate.py       # Evaluation + benchmarking
 ├── scripts/
 │   ├── train.py          # Main training entry point
+│   ├── train_experts.py  # Phase 1: train per-task expert demos
+│   ├── train_bc.py       # Phase 2: behavior-clone from expert demos
 │   └── evaluate.py       # Evaluation entry point
 ├── notebooks/
 │   └── explore.ipynb     # Interactive exploration notebook
@@ -102,6 +106,36 @@ python scripts/train.py \
     --no-compile \
     --device cpu
 ```
+
+### 3-Phase Pipeline (recommended)
+
+```bash
+# Phase 1: train per-task experts and save demos
+python scripts/train_experts.py \
+    --num-workers 8 \
+    --hidden-channels 64 --num-blocks 4 \
+    --K 512 --T 30 \
+    --max-iters 300 --patience 75 \
+    --lr 1e-3 --output-dir demos
+
+# Phase 2: behavior-clone a shared model from solved demos
+python scripts/train_bc.py \
+    --demos-dir demos \
+    --hidden-channels 128 --num-blocks 10 \
+    --epochs 100 --batch-tasks 32 --steps-per-demo 16 \
+    --lr 3e-4 --bf16
+
+# Phase 3: RL fine-tune from the BC checkpoint
+python scripts/train.py \
+    --resume checkpoints/bc_model.pt \
+    --hidden-channels 128 --num-blocks 10 \
+    --num-rollouts 64 --tasks-per-batch 16 \
+    --max-steps 50 --num-grad-steps 16 \
+    --lr 1e-4 --num-iterations 5000 \
+    --bf16 --compile
+```
+
+`scripts/train.py --resume` supports both full training checkpoints and model-only checkpoints (e.g. BC output).
 
 ## Evaluation
 

@@ -155,10 +155,14 @@ def main() -> None:
         ckpt = torch.load(train_cfg.resume, map_location=device, weights_only=False)
         raw_policy = policy._orig_mod if hasattr(policy, "_orig_mod") else policy
         raw_policy.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-        start_iter = ckpt["iteration"] + 1
-        print(f"Resumed from {train_cfg.resume} at iteration {start_iter}")
+        if "optimizer" in ckpt and "scheduler" in ckpt and "iteration" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            start_iter = ckpt["iteration"] + 1
+            print(f"Resumed full state from {train_cfg.resume} at iteration {start_iter}")
+        else:
+            start_iter = 0
+            print(f"Loaded model-only checkpoint from {train_cfg.resume}; starting optimizer fresh")
 
     # Wandb
     if train_cfg.wandb_enabled:

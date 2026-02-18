@@ -10,10 +10,8 @@ Usage:
 """
 
 import argparse
-import json
 import random
 import sys
-import time
 from pathlib import Path
 from typing import List, Tuple
 
@@ -25,8 +23,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from arc_rl.config import ModelConfig, GRID_SIZE, NUM_COLORS
-from arc_rl.dataset import ARCDataset, ARCTask, augment_colors, augment_geometry, Pair, Grid
+from arc_rl.config import ModelConfig, GRID_SIZE
 from arc_rl.env import BatchedARCEnv
 from arc_rl.expert import Demo
 from arc_rl.model import ARCPolicy
@@ -34,11 +31,8 @@ from arc_rl.model import ARCPolicy
 
 @torch.no_grad()
 def replay_demo(
-    task: ARCTask,
     demo: Demo,
-    model_cfg: ModelConfig,
     device: torch.device,
-    augment: bool = True,
 ) -> Tuple[List[torch.Tensor], List[dict]]:
     """Replay a demo trajectory to collect (obs, action) pairs.
 
@@ -46,27 +40,12 @@ def replay_demo(
         observations: list of [1, C, 30, 30] tensors (one per step)
         targets: list of dicts with action labels for each step
     """
-    examples, test_input, target_output = task.get_training_instance(model_cfg.max_examples)
+    if demo.examples is None or demo.test_input is None or demo.target_output is None:
+        raise ValueError(f"Demo for task {demo.task_id} is missing stored context fields.")
 
-    color_perm = None
-    if augment:
-        perm = list(range(10))
-        random.shuffle(perm)
-        inv_perm = [0] * 10
-        for i, p in enumerate(perm):
-            inv_perm[p] = i
-
-        def remap(grid):
-            return [[perm[c] for c in row] for row in grid]
-
-        examples = [(remap(i), remap(o)) for i, o in examples]
-        test_input = remap(test_input)
-        target_output = remap(target_output)
-        color_perm = perm
-
-    instances = [(examples, test_input, target_output)]
+    instances = [(demo.examples, demo.test_input, demo.target_output)]
     env = BatchedARCEnv(instances, K=1, max_steps=len(demo.paint_colors) + 1,
-                        max_examples=model_cfg.max_examples, device=device)
+                        max_examples=3, device=device)
 
     observations = []
     targets = []
@@ -92,9 +71,6 @@ def replay_demo(
         color = demo.paint_colors[step_idx]
         position = demo.paint_positions[step_idx]
 
-        if color_perm is not None:
-            color = color_perm[color]
-
         targets.append({"type": "paint", "color": color, "position": position})
 
         y = position // GRID_SIZE
@@ -109,9 +85,7 @@ def replay_demo(
 
 
 def build_bc_batch(
-    tasks: List[ARCTask],
     demos: List[Demo],
-    model_cfg: ModelConfig,
     device: torch.device,
     max_steps_sample: int = 16,
 ) -> Tuple[torch.Tensor, dict]:
@@ -126,11 +100,11 @@ def build_bc_batch(
     all_position = []
     all_is_resize = []
 
-    for task, demo in zip(tasks, demos):
+    for demo in demos:
         if not demo.solved:
             continue
 
-        observations, targets = replay_demo(task, demo, model_cfg, device, augment=True)
+        observations, targets = replay_demo(demo, device)
 
         # Sample a subset of steps
         n_steps = len(observations)
@@ -240,6 +214,7 @@ def main():
     torch.manual_seed(args.seed)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    use_amp = args.bf16 and device.type == "cuda"
     print(f"Device: {device}")
 
     # Load demos
@@ -260,18 +235,22 @@ def main():
         print("No solved demos! Run train_experts.py first.")
         return
 
-    # Load tasks
-    dataset = ARCDataset(args.data_dir, split="training")
-    task_map = {t.task_id: t for t in dataset.tasks}
-
-    # Filter to solved demos only
-    solved_tasks = []
+    # Filter to solved demos with exact stored context
     solved_demos = []
+    missing_context = 0
     for task_id, demo in demos.items():
-        if demo.solved and task_id in task_map:
-            solved_tasks.append(task_map[task_id])
+        if demo.solved:
+            if demo.examples is None or demo.test_input is None or demo.target_output is None:
+                missing_context += 1
+                continue
             solved_demos.append(demo)
-    print(f"  {len(solved_tasks)} tasks matched to dataset")
+    print(f"  {len(solved_demos)} solved demos with stored context")
+    if missing_context:
+        print(f"  Skipped {missing_context} old demos missing context; regenerate with latest train_experts.py")
+
+    if not solved_demos:
+        print("No usable solved demos with stored context. Re-run train_experts.py to regenerate demos.")
+        return
 
     # Model
     model_cfg = ModelConfig(
@@ -294,7 +273,7 @@ def main():
     # Training
     print(f"\nBC training for {args.epochs} epochs")
     print(f"  batch_tasks={args.batch_tasks}, steps_per_demo={args.steps_per_demo}")
-    n_demos = len(solved_tasks)
+    n_demos = len(solved_demos)
     batches_per_epoch = max(n_demos // args.batch_tasks, 1)
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -313,17 +292,16 @@ def main():
         for batch_idx in pbar:
             start = (batch_idx * args.batch_tasks) % n_demos
             batch_indices = [indices[(start + j) % n_demos] for j in range(args.batch_tasks)]
-            batch_tasks = [solved_tasks[i] for i in batch_indices]
             batch_demos = [solved_demos[i] for i in batch_indices]
 
             obs, targets = build_bc_batch(
-                batch_tasks, batch_demos, model_cfg, device,
+                batch_demos, device,
                 max_steps_sample=args.steps_per_demo,
             )
             if obs is None:
                 continue
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.bf16):
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                 outputs = policy(obs)
                 loss = bc_loss(outputs, targets)
 

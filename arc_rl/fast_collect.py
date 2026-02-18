@@ -94,6 +94,7 @@ def collect_rollouts_fast(
         stored_grid_w: [T, N]
     """
     N = context_channels.shape[0]
+    use_amp = device.type == "cuda"
 
     grids = torch.zeros(N, GRID_SIZE, GRID_SIZE, dtype=torch.long, device=device)
     grid_h = torch.ones(N, dtype=torch.long, device=device)
@@ -112,7 +113,7 @@ def collect_rollouts_fast(
     stored_grid_w[0] = grid_w
 
     obs, _ = _build_obs_and_masks(grids, grid_h, grid_w, context_channels, 0, T)
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
         outputs = policy(obs)
     resize_h, resize_w = _sample_resize_flat(outputs["size_h_logits"], outputs["size_w_logits"])
 
@@ -128,7 +129,7 @@ def collect_rollouts_fast(
         stored_grid_w[step] = grid_w
 
         obs, masks = _build_obs_and_masks(grids, grid_h, grid_w, context_channels, step, T)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
             outputs = policy(obs)
         color, position = _sample_paint_flat(
             outputs["action_logits"], outputs["spatial_logits"], masks
