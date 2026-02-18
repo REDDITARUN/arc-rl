@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training artifacts
+checkpoints/*.pt
+logs/
+wandb/
+outputs/
+
+# Reference repos (clone separately, see README)
+references/
+
+# Keep empty dirs
+!checkpoints/.gitkeep
+!logs/.gitkeep
