@@ -14,12 +14,11 @@ import torch.nn.functional as F
 
 from .config import ModelConfig, GRID_SIZE, NUM_COLORS
 from .dataset import ARCTask, augment_colors, augment_geometry, Grid, Pair
-from .env import BatchedARCEnv, reconstruct_obs
+from .env import BatchedARCEnv, reconstruct_obs, _grid_to_tensor, encode_context
+from .fast_collect import collect_rollouts_fast
 from .model import (
     ARCPolicy,
     StepActions,
-    sample_resize,
-    sample_paint,
     compute_log_probs_resize,
     compute_log_probs_paint,
     compute_entropy_resize,
@@ -47,6 +46,38 @@ class Demo:
     def load(cls, path: str | Path) -> Demo:
         with open(path) as f:
             return cls(**json.load(f))
+
+
+def _encode_instances(
+    instances: List[Tuple[List[Pair], Grid, Grid]],
+    K: int,
+    max_examples: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Encode task instances into tensors for fast collection.
+
+    Returns: (context_channels [N, C, 30, 30], target_h [N], target_w [N], targets [N, 30, 30])
+    """
+    B = len(instances)
+    contexts = []
+    target_h = torch.zeros(B, dtype=torch.long, device=device)
+    target_w = torch.zeros(B, dtype=torch.long, device=device)
+    targets = torch.zeros(B, GRID_SIZE, GRID_SIZE, dtype=torch.long, device=device)
+
+    for b, (examples, test_input, target_output) in enumerate(instances):
+        contexts.append(encode_context(examples, test_input, max_examples, device))
+        th, tw = len(target_output), len(target_output[0])
+        target_h[b] = th
+        target_w[b] = tw
+        targets[b] = _grid_to_tensor(target_output, device)
+
+    ctx = torch.stack(contexts, dim=0).repeat_interleave(K, dim=0)
+    return (
+        ctx,
+        target_h.repeat_interleave(K),
+        target_w.repeat_interleave(K),
+        targets.repeat_interleave(K, dim=0),
+    )
 
 
 def train_task(
@@ -85,50 +116,19 @@ def train_task(
         )
         instances = [(examples, test_input, target_output)]
 
-        # ---- Collect rollouts ----
-        env = BatchedARCEnv(
-            instances, K, T, max_examples=model_cfg.max_examples, device=device
-        )
-        N = env.N  # K (B=1)
+        # Encode once, reuse for collection
+        ctx, t_h, t_w, tgts = _encode_instances(instances, K, model_cfg.max_examples, device)
 
-        stored_grids = torch.zeros(T, N, GRID_SIZE, GRID_SIZE, dtype=torch.long, device=device)
-        stored_grid_h = torch.zeros(T, N, dtype=torch.long, device=device)
-        stored_grid_w = torch.zeros(T, N, dtype=torch.long, device=device)
-
+        # ---- Collect rollouts (fast path) ----
         policy.eval()
         with torch.no_grad():
-            obs = env.reset()
+            result = collect_rollouts_fast(policy, ctx, t_h, t_w, tgts, K, T, device)
 
-            stored_grids[0] = env.grids
-            stored_grid_h[0] = env.grid_h
-            stored_grid_w[0] = env.grid_w
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                outputs = policy(obs)
-            actions_0 = sample_resize(outputs)
-            env.resize(actions_0.resize_h + 1, actions_0.resize_w + 1)
-
-            all_colors = []
-            all_positions = []
-            for step in range(1, T):
-                stored_grids[step] = env.grids
-                stored_grid_h[step] = env.grid_h
-                stored_grid_w[step] = env.grid_w
-
-                obs = env.get_obs()
-                masks = env.get_grid_masks()
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    outputs = policy(obs)
-                actions_t = sample_paint(outputs, masks)
-                y = actions_t.position // GRID_SIZE
-                x = actions_t.position % GRID_SIZE
-                env.paint(actions_t.color, x, y)
-                all_colors.append(actions_t.color)
-                all_positions.append(actions_t.position)
-
-            rewards = env.compute_rewards()
-            paint_colors = torch.stack(all_colors, dim=0)    # [T-1, N]
-            paint_positions = torch.stack(all_positions, dim=0)  # [T-1, N]
+        rewards = result["rewards"]
+        resize_h = result["resize_h"]
+        resize_w = result["resize_w"]
+        paint_colors = result["paint_colors"]
+        paint_positions = result["paint_positions"]
 
         # ---- Track best trajectory ----
         max_r = rewards.max().item()
@@ -137,8 +137,8 @@ def train_task(
             no_improve = 0
             best_idx = rewards.argmax().item()
             best_demo = {
-                "resize_h": (actions_0.resize_h[best_idx] + 1).item(),
-                "resize_w": (actions_0.resize_w[best_idx] + 1).item(),
+                "resize_h": (resize_h[best_idx] + 1).item(),
+                "resize_w": (resize_w[best_idx] + 1).item(),
                 "paint_colors": paint_colors[:, best_idx].cpu().tolist(),
                 "paint_positions": paint_positions[:, best_idx].cpu().tolist(),
             }
@@ -167,13 +167,15 @@ def train_task(
 
         for step_idx in step_indices:
             obs_r, grid_masks = reconstruct_obs(
-                stored_grids[step_idx], stored_grid_h[step_idx], stored_grid_w[step_idx],
-                env.context_channels, step_idx, T, device,
+                result["stored_grids"][step_idx],
+                result["stored_grid_h"][step_idx],
+                result["stored_grid_w"][step_idx],
+                ctx, step_idx, T, device,
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 out = policy(obs_r)
                 if step_idx == 0:
-                    stored = StepActions(resize_h=actions_0.resize_h, resize_w=actions_0.resize_w)
+                    stored = StepActions(resize_h=resize_h, resize_w=resize_w)
                     lp = compute_log_probs_resize(out, stored)
                     ent = compute_entropy_resize(out)
                 else:
@@ -190,7 +192,10 @@ def train_task(
         optimizer.step()
 
     if best_demo is None:
-        best_demo = {"resize_h": 1, "resize_w": 1, "paint_colors": [0] * (T - 1), "paint_positions": [0] * (T - 1)}
+        best_demo = {
+            "resize_h": 1, "resize_w": 1,
+            "paint_colors": [0] * (T - 1), "paint_positions": [0] * (T - 1),
+        }
 
     return Demo(
         task_id=task.task_id,
