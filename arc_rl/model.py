@@ -1,4 +1,4 @@
-"""ResNet policy network (AlphaZero-style) for ARC-RL."""
+"""Policy networks and action helpers for ARC-RL."""
 
 from __future__ import annotations
 
@@ -89,6 +89,158 @@ class ARCPolicy(nn.Module):
             "size_w_logits": self.size_w_fc(pooled),                       # [B, 30]
             "value": self.value_fc(pooled).squeeze(-1),                    # [B]
         }
+
+
+class ARCUNetPolicy(nn.Module):
+    """Light UNet-style policy (reference-inspired) with same output heads."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        C = cfg.hidden_channels
+        self.cfg = cfg
+
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(cfg.in_channels, C, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(C, C, 3, padding=1),
+            nn.ReLU(),
+        )
+        self.down = nn.MaxPool2d(2)  # 30 -> 15
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(C, 2 * C, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(2 * C, 2 * C, 3, padding=1),
+            nn.ReLU(),
+        )
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.dec = nn.Sequential(
+            nn.Conv2d(3 * C, C, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(C, C, 3, padding=1),
+            nn.ReLU(),
+        )
+
+        self.action_fc = nn.Linear(C, cfg.num_colors)
+        self.spatial_conv = nn.Conv2d(C, 1, 1)
+        self.size_h_fc = nn.Linear(C, cfg.grid_size)
+        self.size_w_fc = nn.Linear(C, cfg.grid_size)
+        self.value_fc = nn.Sequential(nn.Linear(C, 256), nn.ReLU(), nn.Linear(256, 1))
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        e1 = self.enc1(x)                             # [B, C, 30, 30]
+        e2 = self.enc2(self.down(e1))                 # [B, 2C, 15, 15]
+        u = self.up(e2)                               # [B, 2C, 30, 30]
+        f = self.dec(torch.cat([e1, u], dim=1))       # [B, C, 30, 30]
+        pooled = F.adaptive_avg_pool2d(f, 1).flatten(1)
+        return {
+            "action_logits": self.action_fc(pooled),
+            "spatial_logits": self.spatial_conv(f).squeeze(1),
+            "size_h_logits": self.size_h_fc(pooled),
+            "size_w_logits": self.size_w_fc(pooled),
+            "value": self.value_fc(pooled).squeeze(-1),
+        }
+
+
+class ARCViTPolicy(nn.Module):
+    """Small ViT-like policy (reference-inspired) with ARC heads."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        C = cfg.hidden_channels
+        self.cfg = cfg
+        self.patch = nn.Conv2d(cfg.in_channels, C, kernel_size=1, stride=1)  # [B, C, 30, 30]
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=C,
+            nhead=max(1, C // 32),
+            dim_feedforward=4 * C,
+            dropout=0.0,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=max(2, cfg.num_blocks // 4))
+        self.norm = nn.LayerNorm(C)
+
+        self.action_fc = nn.Linear(C, cfg.num_colors)
+        self.size_h_fc = nn.Linear(C, cfg.grid_size)
+        self.size_w_fc = nn.Linear(C, cfg.grid_size)
+        self.value_fc = nn.Sequential(nn.Linear(C, 256), nn.GELU(), nn.Linear(256, 1))
+        self.spatial_conv = nn.Conv2d(C, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        f = self.patch(x)                              # [B, C, 30, 30]
+        b, c, h, w = f.shape
+        tokens = f.flatten(2).transpose(1, 2)         # [B, 900, C]
+        tokens = self.norm(self.encoder(tokens))
+        f2 = tokens.transpose(1, 2).reshape(b, c, h, w)
+        pooled = tokens.mean(dim=1)
+        return {
+            "action_logits": self.action_fc(pooled),
+            "spatial_logits": self.spatial_conv(f2).squeeze(1),
+            "size_h_logits": self.size_h_fc(pooled),
+            "size_w_logits": self.size_w_fc(pooled),
+            "value": self.value_fc(pooled).squeeze(-1),
+        }
+
+
+class ARCTRMPolicy(nn.Module):
+    """TRM-style recurrent vision policy (shared iterative refinement)."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        C = cfg.hidden_channels
+        self.cfg = cfg
+        self.num_refine_steps = max(2, cfg.num_blocks // 2)
+
+        self.input_proj = nn.Sequential(
+            nn.Conv2d(cfg.in_channels, C, 3, padding=1, bias=False),
+            nn.BatchNorm2d(C),
+            nn.ReLU(),
+        )
+        self.state_proj = nn.Sequential(
+            nn.Conv2d(C, C, 3, padding=1, bias=False),
+            nn.BatchNorm2d(C),
+            nn.ReLU(),
+        )
+        self.gate = nn.Conv2d(2 * C, C, 1)
+        # Shared refinement block (reused every recurrent step).
+        self.refine = nn.Sequential(ResBlock(C), ResBlock(C))
+
+        self.action_fc = nn.Linear(C, cfg.num_colors)
+        self.spatial_conv = nn.Conv2d(C, 1, 1)
+        self.size_h_fc = nn.Linear(C, cfg.grid_size)
+        self.size_w_fc = nn.Linear(C, cfg.grid_size)
+        self.value_fc = nn.Sequential(nn.Linear(C, 256), nn.ReLU(), nn.Linear(256, 1))
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        x0 = self.input_proj(x)                         # [B, C, 30, 30]
+        h = torch.zeros_like(x0)                        # recurrent state
+        for _ in range(self.num_refine_steps):
+            z = torch.sigmoid(self.gate(torch.cat([x0, h], dim=1)))
+            cand = self.state_proj(h) + x0
+            h = (1.0 - z) * h + z * cand
+            h = self.refine(h)
+        pooled = F.adaptive_avg_pool2d(h, 1).flatten(1)
+        return {
+            "action_logits": self.action_fc(pooled),
+            "spatial_logits": self.spatial_conv(h).squeeze(1),
+            "size_h_logits": self.size_h_fc(pooled),
+            "size_w_logits": self.size_w_fc(pooled),
+            "value": self.value_fc(pooled).squeeze(-1),
+        }
+
+
+def create_policy(cfg: ModelConfig, arch: str = "resnet") -> nn.Module:
+    """Factory for policy architecture."""
+    arch = arch.lower()
+    if arch == "resnet":
+        return ARCPolicy(cfg)
+    if arch == "unet":
+        return ARCUNetPolicy(cfg)
+    if arch == "vit":
+        return ARCViTPolicy(cfg)
+    if arch == "trm":
+        return ARCTRMPolicy(cfg)
+    raise ValueError(f"Unknown arch: {arch}. Choose from: resnet, unet, vit, trm")
 
 
 # ---------------------------------------------------------------------------

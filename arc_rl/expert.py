@@ -17,7 +17,7 @@ from .dataset import ARCTask, augment_colors, augment_geometry, Grid, Pair
 from .env import reconstruct_obs, _grid_to_tensor, encode_context
 from .fast_collect import collect_rollouts_fast
 from .model import (
-    ARCPolicy,
+    create_policy,
     StepActions,
     compute_log_probs_resize,
     compute_log_probs_paint,
@@ -87,6 +87,7 @@ def train_task(
     task: ARCTask,
     model_cfg: ModelConfig,
     device: torch.device,
+    arch: str = "resnet",
     K: int = 128,
     T: int = 50,
     max_iters: int = 2000,
@@ -102,7 +103,7 @@ def train_task(
 
     Returns a Demo with the best trajectory found.
     """
-    policy = ARCPolicy(model_cfg).to(device)
+    policy = create_policy(model_cfg, arch=arch).to(device)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
 
     best_reward = 0.0

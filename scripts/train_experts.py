@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from arc_rl.config import ModelConfig
 from arc_rl.dataset import ARCDataset
+from arc_rl.model import create_policy
 
 
 def worker_fn(
@@ -93,6 +94,7 @@ def worker_fn(
             task=task,
             model_cfg=model_cfg,
             device=device,
+            arch=args_dict["arch"],
             K=args_dict["K"],
             T=args_dict["T"],
             max_iters=args_dict["max_iters"],
@@ -131,6 +133,7 @@ def parse_args():
     # Expert model architecture (small and fast)
     p.add_argument("--hidden-channels", type=int, default=64)
     p.add_argument("--num-blocks", type=int, default=4)
+    p.add_argument("--arch", type=str, default="resnet", choices=["resnet", "unet", "vit", "trm"])
 
     # Per-task training
     p.add_argument("--K", type=int, default=128, help="Rollouts per task")
@@ -160,12 +163,9 @@ def main():
         hidden_channels=args.hidden_channels,
         num_blocks=args.num_blocks,
     )
-    num_params = sum(
-        p.numel()
-        for p in __import__("arc_rl.model", fromlist=["ARCPolicy"]).ARCPolicy(model_cfg).parameters()
-    )
+    num_params = sum(p.numel() for p in create_policy(model_cfg, arch=args.arch).parameters())
     print(f"Expert model: {num_params/1e6:.2f}M params "
-          f"({args.hidden_channels}ch, {args.num_blocks}blk)")
+          f"({args.arch}, {args.hidden_channels}ch, {args.num_blocks}blk)")
     print(f"Per-task: K={args.K}, T={args.T}, max_iters={args.max_iters}, "
           f"patience={args.patience}, lr={args.lr}")
     print(f"Workers: {args.num_workers}")
@@ -196,6 +196,7 @@ def main():
         "num_workers": args.num_workers,
         "device": args.device,
         "inner_log_every": args.inner_log_every,
+        "arch": args.arch,
     }
 
     counter_file = str(output_dir / "_progress.log")
